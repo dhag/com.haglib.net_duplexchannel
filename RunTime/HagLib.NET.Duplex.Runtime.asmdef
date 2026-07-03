@@ -1,0 +1,16 @@
+{
+    "name": "HagLib.NET.Duplex.Runtime",
+    "rootNamespace": "HagLib.NET.Duplex",
+    "references": [
+        "Unity.Nuget.Newtonsoft-Json"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

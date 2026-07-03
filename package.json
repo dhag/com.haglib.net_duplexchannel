@@ -1,0 +1,15 @@
+{
+  "name": "com.haglib.net_duplexchannel",
+  "displayName": "Net_DuplexChannel",
+  "version": "0.1.0",
+  "unity": "6000.0",
+  "description": "双方向通信各種。",
+  "author": {
+    "name": "Yoshihiro Hagihara",
+    "email": "dhag@iwate-u.ac.jp",
+    "url": "https://example.com"
+  },
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1"
+  }
+}
