@@ -351,7 +351,7 @@ namespace HagLib.NET.Duplex
     // TcpListener ベースのサーバ側チャネル（IDuplexChannel 実装）
     // RFC6455 のフレーミングを自前実装。ワイヤ形式は WebSocketDuplexChannel と同一。
     // ====================================================================
-    internal class TcpDuplexServerChannel : IDuplexChannel
+    public class TcpDuplexServerChannel : IDuplexChannel
     {
         private readonly TcpClient _tcpClient;
         private readonly NetworkStream _stream;
@@ -704,7 +704,13 @@ namespace HagLib.NET.Duplex
             {
                 var root = JObject.Parse(json);
                 var msgType = root["type"]?.ToString() ?? "send";
-                var id = root["id"]?.ToObject<int>() ?? 0;
+
+                // envelope の id は数値。旧クライアントは文字列 id（"pc_1"等）を送るため、
+                // 整数トークンのときのみ int 化し、それ以外は 0（例外を投げない）。
+                int id = 0;
+                var idTok = root["id"];
+                if (idTok != null && idTok.Type == JTokenType.Integer)
+                    id = idTok.ToObject<int>();
 
                 TypedPayload payload;
                 var itemsEl = root["items"];
@@ -715,7 +721,9 @@ namespace HagLib.NET.Duplex
                 else if (root["json"] != null)
                     payload = TypedPayload.FromJson(root["json"].ToString());
                 else
-                    payload = new TypedPayload();
+                    // envelope でない生アプリ JSON はフレーム全体を Json ペイロードとして扱い、
+                    // RemoteServerCore.OnDuplexReceived の Json アイテム → ProcessMessage へ渡す。
+                    payload = TypedPayload.FromJson(json);
 
                 var message = new DuplexMessage
                 {
