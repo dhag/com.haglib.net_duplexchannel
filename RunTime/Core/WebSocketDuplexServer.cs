@@ -253,7 +253,7 @@ namespace HagLib.NET.Duplex
                     }
                     catch (Exception ex)
                     {
-                        System.Diagnostics.Debug.WriteLine($"WebSocket accept error: {ex.Message}");
+                        UnityEngine.Debug.LogWarning($"[WebSocketDuplexServer] WebSocket accept error: {ex}");
                     }
                 }
             }
