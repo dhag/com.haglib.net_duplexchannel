@@ -768,13 +768,22 @@ namespace HagLib.NET.Duplex
 
         private void HandleBinaryMessage(byte[] data)
         {
-            if (data.Length < DuplexPacket.HeaderSize) return;
+            if (data.Length < DuplexPacket.HeaderSize)
+            {
+                UnityEngine.Debug.Log($"[EditSync] SrvBin recv={data.Length} parse=too_short");
+                return;
+            }
 
             var header = new byte[DuplexPacket.HeaderSize];
             Buffer.BlockCopy(data, 0, header, 0, DuplexPacket.HeaderSize);
 
             if (!DuplexPacket.TryParseHeader(header, out var type, out var messageId, out var payloadLength, out var tagLength))
+            {
+                UnityEngine.Debug.Log($"[EditSync] SrvBin recv={data.Length} parse=header_fail");
                 return;
+            }
+
+            UnityEngine.Debug.Log($"[EditSync] SrvBin recv={data.Length} parse=ok type={type} msgId={messageId} payload={payloadLength} tag={tagLength}");
 
             var bodyLength = tagLength + payloadLength;
             var body = new byte[bodyLength];
