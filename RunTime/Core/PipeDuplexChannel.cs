@@ -23,6 +23,20 @@ namespace HagLib.NET.Duplex
         public bool IsConnected => _pipeStream?.IsConnected ?? false;
         public string Id { get; }
 
+        /// <summary>
+        /// 診断ログの出力先。既定は null で何も出力しない。
+        /// このファイルは SimpleMcpServer.csproj に Link されており
+        /// UnityEngine に依存できないため、ホスト側で購読すること。
+        /// </summary>
+        public static Action<string> DiagnosticLog;
+
+        private static void Diag(string message)
+        {
+            var sink = DiagnosticLog;
+            if (sink == null) return;
+            try { sink(message); } catch { }
+        }
+
         public event Action<IDuplexChannel, DuplexMessage> OnReceived;
         public event Action<IDuplexChannel> OnDisconnected;
 
@@ -63,9 +77,30 @@ namespace HagLib.NET.Duplex
                 PipeOptions.Asynchronous);
 
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
-            
-            await clientStream.ConnectAsync(timeoutMs, linkedCts.Token).ConfigureAwait(false);
-            
+
+            Diag($"[PipeDuplexChannel] 接続開始: pipe={pipeName}; timeout={timeoutMs}ms");
+
+            var startedAt = System.Diagnostics.Stopwatch.StartNew();
+
+            try
+            {
+                await clientStream.ConnectAsync(timeoutMs, linkedCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                startedAt.Stop();
+                Diag($"[PipeDuplexChannel] 接続失敗: 経過={startedAt.ElapsedMilliseconds}ms; {ex.GetType().Name}: {ex.Message}");
+
+                // 失敗した NamedPipeClientStream は _pipeStream に入らないため
+                // ClosePipe では解放されない。ここで確実に破棄する。
+                try { clientStream.Dispose(); } catch { }
+
+                throw;
+            }
+
+            startedAt.Stop();
+            Diag($"[PipeDuplexChannel] 接続成功: 経過={startedAt.ElapsedMilliseconds}ms");
+
             _pipeStream = clientStream;
             StartReceiving();
         }
@@ -172,8 +207,20 @@ namespace HagLib.NET.Duplex
 
             _cts.Cancel();
             ClosePipe();
-            _cts.Dispose();
-            _sendLock?.Dispose();
+
+            // _cts.Dispose() と _sendLock.Dispose() は呼ばない。
+            //
+            // ReceiveLoopAsync の ReadAsync と SendInternalAsync の WriteAsync は
+            // 同じ _cts.Token で登録されており、キャンセル後に IO 完了スレッドから
+            // コールバックが走って CancellationTokenRegistration が Token を読む。
+            // ここで破棄すると ObjectDisposedException になり、
+            // native-to-managed のコールバック上で未処理例外になるため Unity ごと落ちる
+            // （PipeDuplexServer.Dispose で同じ構造の落ち方を確認済み）。
+            //
+            // _sendLock も同様。ReplyAsync の送出中に切断が来ると
+            // WaitAsync で待っている側が ObjectDisposedException になる。
+            //
+            // Cancel と ClosePipe で機能は止まる。実体はファイナライザで回収される。
         }
 
         private void ClosePipe()

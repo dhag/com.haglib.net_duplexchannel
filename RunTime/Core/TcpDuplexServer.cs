@@ -21,6 +21,25 @@ namespace HagLib.NET.Duplex
 
         public bool IsListening => _listener?.IsBound ?? false;
 
+        /// <summary>
+        /// これまでに受理した接続の総数。id の通し番号（C0001…）と同じ。
+        /// </summary>
+        public int AcceptedCount => _clientIdCounter;
+
+        /// <summary>
+        /// 診断ログの出力先。既定は null で何も出力しない。
+        /// このファイルは SimpleMcpServer.csproj に Link され得るため
+        /// UnityEngine に依存できない。ホスト側で購読すること。
+        /// </summary>
+        public static Action<string> DiagnosticLog;
+
+        private static void Diag(string message)
+        {
+            var sink = DiagnosticLog;
+            if (sink == null) return;
+            try { sink(message); } catch { }
+        }
+
         public IDuplexChannel[] Clients
         {
             get
@@ -181,11 +200,15 @@ namespace HagLib.NET.Duplex
             }
             _clients.Clear();
 
-            _cts.Dispose();
+            // _cts.Dispose() は呼ばない。AcceptAsync の完了コールバックが
+            // 後から Token を読むため、破棄すると未処理例外になる
+            // （PipeDuplexServer.Dispose で同じ構造の落ち方を確認済み）。
         }
 
         private async Task AcceptLoopAsync(CancellationToken ct)
         {
+            Diag("[TcpDuplexServer] accept ループ開始");
+
             try
             {
                 while (!ct.IsCancellationRequested)
@@ -193,6 +216,8 @@ namespace HagLib.NET.Duplex
                     var socket = await _listener.AcceptAsync().ConfigureAwait(false);
 
                     var clientId = $"C{Interlocked.Increment(ref _clientIdCounter):D4}";
+                    Diag($"[TcpDuplexServer] 接続受理: id={clientId}; 接続数={_clients.Count}");
+
                     var channel = new TcpDuplexChannel(socket, clientId);
 
                     // イベントハンドラ設定
@@ -208,15 +233,26 @@ namespace HagLib.NET.Duplex
                 }
             }
             catch (OperationCanceledException) { }
-            catch (SocketException) { } // リスナーがクローズされた
+            catch (SocketException ex) { Diag($"[TcpDuplexServer] accept 終了: SocketException: {ex.Message}"); }
             catch (ObjectDisposedException) { }
+            catch (Exception ex) { Diag($"[TcpDuplexServer] accept ループが例外で終了: {ex.GetType().Name}: {ex.Message}"); }
         }
 
         private void HandleClientDisconnected(IDuplexChannel channel)
         {
-            if (_clients.TryRemove(channel.Id, out _))
+            if (_clients.TryRemove(channel.Id, out var removed))
             {
                 OnClientDisconnected?.Invoke(channel);
+
+                try
+                {
+                    removed?.Dispose();
+                    Diag($"[TcpDuplexServer] 切断処理: id={channel.Id}; 接続数={_clients.Count}");
+                }
+                catch (Exception ex)
+                {
+                    Diag($"[TcpDuplexServer] 切断処理で例外: id={channel.Id}; {ex.GetType().Name}: {ex.Message}");
+                }
             }
         }
     }

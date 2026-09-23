@@ -33,6 +33,9 @@ namespace HagLib.NET.Duplex
 
         public bool IsListening => _listening;
 
+        /// <summary>実際に待ち受けているポート。port=0 で開始した場合は OS が割り当てた番号。未開始は 0。</summary>
+        public int BoundPort { get; private set; }
+
         /// <summary>
         /// 非WebSocketのHTTP GET要求に対して返すHTMLを供給する。
         /// null の場合は既定の簡易HTMLを返す。
@@ -82,27 +85,35 @@ namespace HagLib.NET.Duplex
 
             // IPv4 loopback (127.0.0.1) と IPv6 loopback (::1) の両方を待ち受ける。
             // ブラウザは ::1、Unity クライアントは 127.0.0.1 で接続してくるため。
+            //
+            // port=0 のときは OS に割り当てさせる。先に取れた側の実ポートを
+            // もう一方にも使い、両者を同じ番号に揃える（ブラウザ HTML はポート 1 つで接続する）。
+            int requested = port;
             try
             {
-                _listenerV4 = new TcpListener(IPAddress.Loopback, port);
+                _listenerV4 = new TcpListener(IPAddress.Loopback, requested);
                 _listenerV4.Start();
+                if (requested == 0) requested = ((IPEndPoint)_listenerV4.LocalEndpoint).Port;
                 _acceptTaskV4 = Task.Run(() => AcceptLoopAsync(_listenerV4, _cts.Token), ct);
             }
             catch (Exception ex)
             {
                 UnityEngine.Debug.LogWarning($"[WebSocketDuplexServer] IPv4 loopback listen 失敗: {ex.Message}");
+                try { _listenerV4?.Stop(); } catch { }
                 _listenerV4 = null;
             }
 
             try
             {
-                _listenerV6 = new TcpListener(IPAddress.IPv6Loopback, port);
+                _listenerV6 = new TcpListener(IPAddress.IPv6Loopback, requested);
                 _listenerV6.Start();
+                if (requested == 0) requested = ((IPEndPoint)_listenerV6.LocalEndpoint).Port;
                 _acceptTaskV6 = Task.Run(() => AcceptLoopAsync(_listenerV6, _cts.Token), ct);
             }
             catch (Exception ex)
             {
                 UnityEngine.Debug.LogWarning($"[WebSocketDuplexServer] IPv6 loopback listen 失敗: {ex.Message}");
+                try { _listenerV6?.Stop(); } catch { }
                 _listenerV6 = null;
             }
 
@@ -110,6 +121,7 @@ namespace HagLib.NET.Duplex
             if (!_listening)
                 throw new InvalidOperationException("Failed to start listener on both IPv4 and IPv6 loopback.");
 
+            BoundPort = requested;
             return Task.CompletedTask;
         }
 

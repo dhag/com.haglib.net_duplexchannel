@@ -166,9 +166,21 @@ namespace HagLib.NET.Duplex
 
             _cts.Cancel();
             CloseSocket();
-            _cts.Dispose();
             _stream?.Dispose();
-            _sendLock?.Dispose();
+
+            // _cts.Dispose() と _sendLock.Dispose() は呼ばない。
+            //
+            // ReceiveLoopAsync の ReadAsync と SendInternalAsync の WriteAsync は
+            // 同じ _cts.Token で登録されており、キャンセル後に IO 完了スレッドから
+            // コールバックが走って CancellationTokenRegistration が Token を読む。
+            // ここで破棄すると ObjectDisposedException になり、native-to-managed の
+            // コールバック上で未処理例外になるため Unity ごと落ちる
+            // （PipeDuplexServer.Dispose で同じ構造の落ち方を確認済み）。
+            //
+            // _sendLock も同様。ReplyAsync の送出中に切断が来ると
+            // WaitAsync で待っている側が ObjectDisposedException になる。
+            //
+            // Cancel と CloseSocket で機能は止まる。実体はファイナライザで回収される。
         }
 
         private void CloseSocket()

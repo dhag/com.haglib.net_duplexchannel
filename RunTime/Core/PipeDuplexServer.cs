@@ -22,6 +22,26 @@ namespace HagLib.NET.Duplex
 
         public bool IsListening => _isListening;
 
+        /// <summary>
+        /// これまでに受理した接続の総数。id の通し番号（P0001…）と同じ。
+        /// 受理されなかった接続との区別を、ログを読まずに付けるために公開する。
+        /// </summary>
+        public int AcceptedCount => _clientIdCounter;
+
+        /// <summary>
+        /// 診断ログの出力先。既定は null で何も出力しない。
+        /// このファイルは SimpleMcpServer.csproj に Link されており
+        /// UnityEngine に依存できないため、ホスト側で購読すること。
+        /// </summary>
+        public static Action<string> DiagnosticLog;
+
+        private static void Diag(string message)
+        {
+            var sink = DiagnosticLog;
+            if (sink == null) return;
+            try { sink(message); } catch { }
+        }
+
         public IDuplexChannel[] Clients
         {
             get
@@ -163,36 +183,100 @@ namespace HagLib.NET.Duplex
             }
             _clients.Clear();
 
-            _cts.Dispose();
+            // _cts.Dispose() は呼ばない。
+            //
+            // AcceptLoopAsync が待っている WaitForConnectionAsync は、
+            // キャンセル後に IO 完了スレッドからコールバックが走り、
+            // CancellationTokenRegistration が _cts.Token を読む。
+            // ここで破棄すると ObjectDisposedException になり、
+            // native-to-managed のコールバック上で未処理例外になるため
+            // Unity ごと落ちる（Editor.log に RegisterUECatcher → Shut down. として残る）。
+            // Cancel 済みなので登録は解除され、実体はファイナライザで回収される。
         }
 
+        /// <summary>
+        /// 接続を受け付け続ける。
+        ///
+        /// 【待ち受けを切らさないこと】
+        ///   NamedPipeServerStream は maxNumberOfServerInstances=16 で作れるが、
+        ///   実際に待ち受けているのは「WaitForConnectionAsync を呼んでいるインスタンス」
+        ///   だけである。受理してからチャネルを組み立てるまでの間に次のリスナを
+        ///   作らないと、その隙間に来たクライアントは
+        ///   「接続は成功するのに対応するサーバインスタンスが無い」状態になり、
+        ///   要求が誰にも読まれず応答も返らない。
+        ///   実測では 3 回に 2 回がこの状態に落ちていた。
+        ///
+        ///   そのため、受理したら真っ先に次のリスナを作り、チャネルの生成は
+        ///   そのあとに行う。
+        /// </summary>
         private async Task AcceptLoopAsync(CancellationToken ct)
         {
+            NamedPipeServerStream pipeServer = null;
+
             try
             {
                 while (!ct.IsCancellationRequested && _clients.Count < _maxClients)
                 {
-                    // 新しいパイプサーバーインスタンスを作成
-                    var pipeServer = new NamedPipeServerStream(
-                        _pipeName,
-                        PipeDirection.InOut,
-                        _maxClients,
-                        PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous);
+                    if (pipeServer == null)
+                    {
+                        pipeServer = CreateListener();
+                        Diag($"[PipeDuplexServer] リスナ生成: pipe={_pipeName}; 接続数={_clients.Count}");
+                    }
 
+                    NamedPipeServerStream accepted;
                     try
                     {
                         // クライアント接続を待つ
                         await pipeServer.WaitForConnectionAsync(ct).ConfigureAwait(false);
 
+                        // 受理したものをローカルへ移し、待ち受け枠を空ける。
+                        accepted   = pipeServer;
+                        pipeServer = null;
+
                         if (ct.IsCancellationRequested)
                         {
-                            pipeServer.Close();
+                            accepted.Close();
+                            Diag("[PipeDuplexServer] accept ループ中断: 受理直後にキャンセル");
                             break;
                         }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        pipeServer?.Close();
+                        pipeServer = null;
+                        Diag("[PipeDuplexServer] accept ループ中断: キャンセル");
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        pipeServer?.Close();
+                        pipeServer = null;
+                        Diag($"[PipeDuplexServer] 接続待ちで例外: {ex.GetType().Name}: {ex.Message}");
+                        continue;   // 次の接続を待つ
+                    }
 
-                        var clientId = $"P{Interlocked.Increment(ref _clientIdCounter):D4}";
-                        var channel = new PipeDuplexChannel(pipeServer, clientId);
+                    var clientId = $"P{Interlocked.Increment(ref _clientIdCounter):D4}";
+                    Diag($"[PipeDuplexServer] 接続受理: id={clientId}");
+
+                    // ★ チャネルを組み立てる前に次のリスナを立てる。
+                    //    ここを後回しにすると待ち受けが切れる。
+                    if (!ct.IsCancellationRequested && _clients.Count + 1 < _maxClients)
+                    {
+                        try
+                        {
+                            pipeServer = CreateListener();
+                            Diag($"[PipeDuplexServer] リスナ生成: pipe={_pipeName}; 接続数={_clients.Count}");
+                        }
+                        catch (Exception ex)
+                        {
+                            pipeServer = null;
+                            Diag($"[PipeDuplexServer] リスナ生成に失敗: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }
+
+                    try
+                    {
+                        var channel = new PipeDuplexChannel(accepted, clientId);
 
                         // イベントハンドラ設定
                         channel.OnReceived += (ch, msg) => OnReceived?.Invoke(ch, msg);
@@ -205,27 +289,52 @@ namespace HagLib.NET.Duplex
 
                         OnClientConnected?.Invoke(channel);
                     }
-                    catch (OperationCanceledException)
+                    catch (Exception ex)
                     {
-                        pipeServer.Close();
-                        break;
-                    }
-                    catch (Exception)
-                    {
-                        pipeServer.Close();
-                        // 次の接続を待つ
+                        try { accepted.Close(); } catch { }
+                        Diag($"[PipeDuplexServer] チャネル生成で例外: id={clientId}; {ex.GetType().Name}: {ex.Message}");
                     }
                 }
+
+                Diag($"[PipeDuplexServer] accept ループ終了: 接続数={_clients.Count}; キャンセル={ct.IsCancellationRequested}");
             }
             catch (OperationCanceledException) { }
-            catch (Exception) { }
+            catch (Exception ex)
+            {
+                Diag($"[PipeDuplexServer] accept ループが例外で終了: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                try { pipeServer?.Close(); } catch { }
+            }
         }
+
+        /// <summary>待ち受け用の NamedPipeServerStream を 1 個作る。</summary>
+        private NamedPipeServerStream CreateListener()
+            => new NamedPipeServerStream(
+                _pipeName,
+                PipeDirection.InOut,
+                _maxClients,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous);
 
         private void HandleClientDisconnected(IDuplexChannel channel)
         {
-            if (_clients.TryRemove(channel.Id, out _))
+            if (_clients.TryRemove(channel.Id, out var removed))
             {
                 OnClientDisconnected?.Invoke(channel);
+
+                // ReceiveLoopAsync の finally は ClosePipe を呼ばないため、
+                // ここで破棄しないと NamedPipeServerStream が開いたまま残る。
+                try
+                {
+                    removed?.Dispose();
+                    Diag($"[PipeDuplexServer] 切断処理: id={channel.Id}; 破棄=成功; 接続数={_clients.Count}");
+                }
+                catch (Exception ex)
+                {
+                    Diag($"[PipeDuplexServer] 切断処理: id={channel.Id}; 破棄=例外 {ex.GetType().Name}: {ex.Message}");
+                }
             }
         }
     }
