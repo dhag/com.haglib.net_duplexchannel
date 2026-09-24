@@ -21,12 +21,10 @@ namespace HagLib.NET.Duplex
     /// </summary>
     public class WebSocketDuplexServer : IDuplexServer
     {
-        private TcpListener _listenerV4;
-        private TcpListener _listenerV6;
+        private readonly List<TcpListener> _listeners = new List<TcpListener>();
+        private readonly List<Task> _acceptTasks = new List<Task>();
         private readonly ConcurrentDictionary<string, TcpDuplexServerChannel> _clients;
         private readonly CancellationTokenSource _cts;
-        private Task _acceptTaskV4;
-        private Task _acceptTaskV6;
         private bool _disposed;
         private bool _listening;
         private int _clientIdCounter;
@@ -35,6 +33,21 @@ namespace HagLib.NET.Duplex
 
         /// <summary>実際に待ち受けているポート。port=0 で開始した場合は OS が割り当てた番号。未開始は 0。</summary>
         public int BoundPort { get; private set; }
+
+        /// <summary>同じ PC の中だけ（IPv4 の 127.0.0.1 と IPv6 の ::1）。ListenAddresses の既定値。</summary>
+        public static IPAddress[] LoopbackAddresses => new[] { IPAddress.Loopback, IPAddress.IPv6Loopback };
+
+        /// <summary>この PC のすべてのアドレス（IPv4 と IPv6）。LAN 上の別の PC からも接続できる。</summary>
+        public static IPAddress[] AnyAddresses => new[] { IPAddress.Any, IPAddress.IPv6Any };
+
+        /// <summary>
+        /// 待ち受けるアドレス。開始前に設定する。null・空は LoopbackAddresses と同じ。
+        /// 既定は LoopbackAddresses（同じ PC の中からだけ接続を受ける）。
+        /// </summary>
+        public IPAddress[] ListenAddresses { get; set; } = LoopbackAddresses;
+
+        /// <summary>実際に待ち受けているアドレス（開始できたものだけ）。未開始は空。</summary>
+        public IPAddress[] BoundAddresses { get; private set; } = Array.Empty<IPAddress>();
 
         /// <summary>
         /// 非WebSocketのHTTP GET要求に対して返すHTMLを供給する。
@@ -80,47 +93,45 @@ namespace HagLib.NET.Duplex
 
         private Task StartInternal(int port, CancellationToken ct)
         {
-            if (_listenerV4 != null || _listenerV6 != null)
+            if (_listeners.Count > 0)
                 throw new InvalidOperationException("Server is already running.");
 
-            // IPv4 loopback (127.0.0.1) と IPv6 loopback (::1) の両方を待ち受ける。
-            // ブラウザは ::1、Unity クライアントは 127.0.0.1 で接続してくるため。
+            // ListenAddresses の各アドレスで待ち受ける（既定は 127.0.0.1 と ::1）。
+            // IPv4 と IPv6 の両方を既定にしているのは、ブラウザは ::1、Unity クライアントは 127.0.0.1 で
+            // 接続してくるため。
             //
-            // port=0 のときは OS に割り当てさせる。先に取れた側の実ポートを
-            // もう一方にも使い、両者を同じ番号に揃える（ブラウザ HTML はポート 1 つで接続する）。
+            // port=0 のときは OS に割り当てさせる。最初に取れた実ポートを残りにも使い、
+            // 全アドレスを同じ番号に揃える（ブラウザ HTML はポート 1 つで接続する）。
+            var addrs = (ListenAddresses == null || ListenAddresses.Length == 0) ? LoopbackAddresses : ListenAddresses;
+            var bound = new List<IPAddress>();
             int requested = port;
-            try
+            foreach (var addr in addrs)
             {
-                _listenerV4 = new TcpListener(IPAddress.Loopback, requested);
-                _listenerV4.Start();
-                if (requested == 0) requested = ((IPEndPoint)_listenerV4.LocalEndpoint).Port;
-                _acceptTaskV4 = Task.Run(() => AcceptLoopAsync(_listenerV4, _cts.Token), ct);
-            }
-            catch (Exception ex)
-            {
-                UnityEngine.Debug.LogWarning($"[WebSocketDuplexServer] IPv4 loopback listen 失敗: {ex.Message}");
-                try { _listenerV4?.Stop(); } catch { }
-                _listenerV4 = null;
-            }
-
-            try
-            {
-                _listenerV6 = new TcpListener(IPAddress.IPv6Loopback, requested);
-                _listenerV6.Start();
-                if (requested == 0) requested = ((IPEndPoint)_listenerV6.LocalEndpoint).Port;
-                _acceptTaskV6 = Task.Run(() => AcceptLoopAsync(_listenerV6, _cts.Token), ct);
-            }
-            catch (Exception ex)
-            {
-                UnityEngine.Debug.LogWarning($"[WebSocketDuplexServer] IPv6 loopback listen 失敗: {ex.Message}");
-                try { _listenerV6?.Stop(); } catch { }
-                _listenerV6 = null;
+                if (addr == null) continue;
+                TcpListener listener = null;
+                try
+                {
+                    listener = new TcpListener(addr, requested);
+                    listener.Start();
+                    if (requested == 0) requested = ((IPEndPoint)listener.LocalEndpoint).Port;
+                    var l = listener;
+                    _listeners.Add(l);
+                    _acceptTasks.Add(Task.Run(() => AcceptLoopAsync(l, _cts.Token), ct));
+                    bound.Add(addr);
+                }
+                catch (Exception ex)
+                {
+                    UnityEngine.Debug.LogWarning($"[WebSocketDuplexServer] {addr} listen 失敗: {ex.Message}");
+                    try { listener?.Stop(); } catch { }
+                }
             }
 
-            _listening = _listenerV4 != null || _listenerV6 != null;
+            _listening = _listeners.Count > 0;
             if (!_listening)
-                throw new InvalidOperationException("Failed to start listener on both IPv4 and IPv6 loopback.");
+                throw new InvalidOperationException(
+                    "Failed to start listener on any address: " + string.Join(", ", addrs.Where(a => a != null)));
 
+            BoundAddresses = bound.ToArray();
             BoundPort = requested;
             return Task.CompletedTask;
         }
@@ -280,18 +291,23 @@ namespace HagLib.NET.Duplex
             if (_disposed) return;
 
             _cts.Cancel();
-            try { _listenerV4?.Stop(); } catch { }
-            try { _listenerV6?.Stop(); } catch { }
-            _listenerV4 = null;
-            _listenerV6 = null;
-            _listening = false;
+            StopListeners();
 
             foreach (var client in _clients.Values)
                 try { await client.CloseAsync().ConfigureAwait(false); } catch { }
             _clients.Clear();
 
-            if (_acceptTaskV4 != null) { try { await _acceptTaskV4.ConfigureAwait(false); } catch { } }
-            if (_acceptTaskV6 != null) { try { await _acceptTaskV6.ConfigureAwait(false); } catch { } }
+            var tasks = _acceptTasks.ToArray();
+            _acceptTasks.Clear();
+            foreach (var t in tasks) { try { await t.ConfigureAwait(false); } catch { } }
+        }
+
+        private void StopListeners()
+        {
+            foreach (var l in _listeners) { try { l.Stop(); } catch { } }
+            _listeners.Clear();
+            BoundAddresses = Array.Empty<IPAddress>();
+            _listening = false;
         }
 
         public void Dispose()
@@ -300,11 +316,8 @@ namespace HagLib.NET.Duplex
             _disposed = true;
 
             _cts.Cancel();
-            try { _listenerV4?.Stop(); } catch { }
-            try { _listenerV6?.Stop(); } catch { }
-            _listenerV4 = null;
-            _listenerV6 = null;
-            _listening = false;
+            StopListeners();
+            _acceptTasks.Clear();
 
             foreach (var client in _clients.Values) client.Dispose();
             _clients.Clear();
