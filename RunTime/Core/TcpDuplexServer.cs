@@ -85,8 +85,26 @@ namespace HagLib.NET.Duplex
                 throw new InvalidOperationException("Server is already running.");
 
             _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            _listener.Bind(new IPEndPoint(address, port));
-            _listener.Listen(100);
+
+            // 前の待ち受けで受理した接続が、まだ同じポートを使っていても bind できるようにする。
+            // Editor 制御（8770）では、要求の途中の接続を抱えたままドメインリロードに入ると、
+            // 前の待ち受けを閉じたあとも受理済みの接続が残り、再起動の bind が
+            // 「各ソケット アドレスに対して…1 つのみ」で失敗していた（2026-10-04、2 回再現）。
+            try { _listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true); }
+            catch { }
+
+            try
+            {
+                _listener.Bind(new IPEndPoint(address, port));
+                _listener.Listen(100);
+            }
+            catch
+            {
+                // bind できなかったソケットは呼び出し側へ残さない（次の StartAsync を通すため）。
+                try { _listener.Close(); } catch { }
+                _listener = null;
+                throw;
+            }
 
             _acceptTask = Task.Run(() => AcceptLoopAsync(_cts.Token), ct);
 
@@ -194,9 +212,26 @@ namespace HagLib.NET.Duplex
 
             try { _listener?.Close(); } catch { }
 
+            // 受理済みの接続を先に閉じる。待ち受けを閉じても、受理済みの接続は
+            // 同じポートを使い続けるので、残っていると再起動の bind を妨げる。
+            // accept ループの終了を待つより前に閉じる（待ちが時間切れでも閉じ漏れないように）。
             foreach (var client in _clients.Values)
             {
-                client.Dispose();
+                try { client.Dispose(); } catch { }
+            }
+            _clients.Clear();
+
+            // accept ループの終了を待つ。
+            // 待ち受け中の AcceptAsync が残ったままドメインリロードに入ると、
+            // Close したはずの待ち受けソケットが OS 側で開いたまま残り、
+            // リロード後の再起動で同じポートに bind できなくなる（Editor 制御 8770 で発生）。
+            // ループは ConfigureAwait(false) でスレッドプール上を回るので、ここで待っても詰まらない。
+            try { _acceptTask?.Wait(2000); } catch { }
+
+            // 待っている間に受理されたものがあれば、それも閉じる（受理側は停止中なら自分で閉じるが念のため）。
+            foreach (var client in _clients.Values)
+            {
+                try { client.Dispose(); } catch { }
             }
             _clients.Clear();
 
@@ -214,6 +249,14 @@ namespace HagLib.NET.Duplex
                 while (!ct.IsCancellationRequested)
                 {
                     var socket = await _listener.AcceptAsync().ConfigureAwait(false);
+
+                    // 停止の途中で受理が完了したものは、登録せずに閉じる
+                    // （登録すると停止側の閉じ漏れになり、ポートを掴んだまま残る）。
+                    if (ct.IsCancellationRequested || _disposed)
+                    {
+                        try { socket.Close(); } catch { }
+                        break;
+                    }
 
                     var clientId = $"C{Interlocked.Increment(ref _clientIdCounter):D4}";
                     Diag($"[TcpDuplexServer] 接続受理: id={clientId}; 接続数={_clients.Count}");
@@ -236,6 +279,7 @@ namespace HagLib.NET.Duplex
             catch (SocketException ex) { Diag($"[TcpDuplexServer] accept 終了: SocketException: {ex.Message}"); }
             catch (ObjectDisposedException) { }
             catch (Exception ex) { Diag($"[TcpDuplexServer] accept ループが例外で終了: {ex.GetType().Name}: {ex.Message}"); }
+            finally { Diag("[TcpDuplexServer] accept ループ終了"); }
         }
 
         private void HandleClientDisconnected(IDuplexChannel channel)
